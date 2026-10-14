@@ -1,0 +1,591 @@
+# -*- coding: utf-8 -*-
+"""一键跑全部回归测试。
+
+    python run_all_tests.py            # 全部（端到端会自动临时起服务）
+    python run_all_tests.py --quick    # 跳过需要起服务的端到端
+
+为什么要有这个脚本：测试分散在 5 个 Python 脚本 + 2 个 Node 脚本里，
+其中端到端必须先起后端，靠人记很容易漏跑——漏跑的那次偏偏就会放出回归。
+
+行为说明：
+  · 8770 上已经有本项目服务在跑 → 直接复用，不重启（避免打断你正在用的控制台）；
+  · 8770 空着 → 临时起一个，跑完自动关掉；
+  · 8770 被别的程序占着 → 跳过端到端并明确说明。
+"""
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+# Windows GBK 控制台乱码快修（v010）：测试脚本全 UTF-8 输出。
+# 背景：默认 stdout 编码跟控制台代码页（GBK/cp936）走，带中文/框线的测试
+#   输出会变成乱码，甚至让人把「乱码」误判成「异常」。三层保险：
+#   ① 本进程 stdout/stderr 强制 UTF-8；
+#   ② 环境变量 PYTHONIOENCODING=utf-8 —— 子套件进程继承（见下方 subprocess 调用）；
+#   ③ 子进程命令行统一带 -X utf8。
+if sys.stdout and hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if sys.stderr and hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+# v023.1：统一流量调度器默认按「保守档」（10 分钟 30 请求）限流——回归套件里
+# 多个 fixture 套件会打到 127.0.0.1 的本地模拟服务，正常量级就会触顶。
+# 测试模式显式放大预算与并发（status 接口会公开该标志，生产不得开启）；
+# 单跑某个套件时也需带上该环境变量：
+#   PowerShell:  $env:AGENT_TRAFFIC_TEST_MODE="1"; python test_diff.py
+os.environ.setdefault("AGENT_TRAFFIC_TEST_MODE", "1")
+
+ROOT = Path(__file__).resolve().parent
+PORT = 8770
+BASE = f"http://127.0.0.1:{PORT}"
+
+# 后端套件需要 fastapi/uvicorn/httpx。解释器选错时它们会整片崩掉，
+# 所以不写死 sys.executable，而是挑一个真正装了依赖的（见 pick_python）。
+NODE = "node"
+
+# 运行后端套件所需的最小依赖
+REQUIRED_MODULES = ("fastapi", "uvicorn", "httpx")
+
+# 未配置 DeepSeek Key 时必然失败的一项（依赖环境，不是回归）
+KNOWN_ENV_FAIL = "命中关键词时会路由到 deepseek 供应商"
+
+PY_TESTS = [
+    # 授权红线排第一：越权是本项目最不能接受的失败，宁可它先红
+    ("授权白名单（安全红线）", "test_scope.py", False),
+    ("py_exec 沙箱（v010 P0-1）", "test_sandbox.py", False),
+    ("云端外发脱敏（v010 P0-4）", "test_redact.py", False),
+    ("数据归属校验（v010 P1-3）", "test_ownership.py", False),
+    ("工具分级与配置一致性（第二道闸门）", "test_registry.py", False),
+    ("代码执行通道 py_exec（L3）", "test_pyexec.py", False),
+    ("HTTP 重放器（授权与只读）", "test_replayer.py", False),
+    ("证据状态模型与报告增强（v012）", "test_evidence.py", False),
+    ("请求导入（Burp/HAR，v017.1）", "test_import.py", False),
+    ("测试身份库与 DPAPI（v017.2）", "test_identity_store.py", False),
+    ("只读身份差分（v017.3）", "test_diff.py", False),
+    ("证据链与复核闸门（v017.4）", "test_evidence_bundle.py", False),
+    ("流程绕过检测（v017.5）", "test_flow.py", False),
+    ("整改报告修复回归（v022）", "test_022_fixes.py", False),
+    ("统一流量调度（v023.1）", "test_traffic.py", False),
+    ("py_exec 与扫描器治理（v023.2）", "test_pyexec_traffic.py", False),
+    ("网络层 WAF 状态机（v023.3）", "test_waf.py", False),
+    ("低流量测试策略（v023.4）", "test_lowtraffic.py", False),
+    ("流量审计与面板支撑（v023.5）", "test_traffic_audit.py", False),
+    ("实战缺陷修复（v023.6）", "test_023_fixes.py", False),
+    ("实战缺陷修复·第二批（v023.6）", "test_023_fixes2.py", False),
+    ("受控脚本接口可用性（v023.7）", "test_023_fixes3.py", False),
+    ("事实自动注入（v023.7）", "test_023_fixes4.py", False),
+    ("证据可取回性·截断落盘与检索片段（v031）", "test_031_fixes.py", False),
+    ("受控接口可用性修复·error键与TMPDIR（v032）", "test_032_fixes.py", False),
+    ("落盘换行污染修复·原始字节与同口径（v033）", "test_033_fixes.py", False),
+    ("口径一致性·rb读法与短响应元数据（v034）", "test_034_fixes.py", False),
+    ("公益SRC合规纪律与落盘数据即清（v035）", "test_035_fixes.py", False),
+    ("漏洞类型专项纪律与报告合规（v036）", "test_036_fixes.py", False),
+    ("清理路径异常不得穿透·服务不再崩（v037）", "test_037_fixes.py", False),
+    ("扫路径≠遍历接口·恢复敏感目录扫描（v038）", "test_038_fixes.py", False),
+    ("产品指纹索引·内置字典·参数坑与判定口径（v039）", "test_039_fixes.py", False),
+    ("ConnectRefused不误熔断·协议预筛（v040）", "test_040_fixes.py", False),
+    ("token预算预警与收尾·请求回显·续跑修复（v041）", "test_041_fixes.py", False),
+    ("截断标志恒存在·已知泄露模式·密钥处置（v042）", "test_042_fixes.py", False),
+    ("云端外发脱敏·密钥材料与摘要值边界（v043）", "test_043_fixes.py", False),
+    ("Burp MCP 接入·治理闸门与优雅降级（v044）", "test_044_mcp.py", False),
+    ("确认闸门前置与口径修复（v045）", "test_045_fixes.py", False),
+    ("py_exec 能力分档·交互式工具·超时口径（v047）", "test_047_fixes.py", False),
+    ("文档契约·getattr 例外·任务级约束闸门（v048）", "test_048_fixes.py", False),
+    ("配置控制台·口令闸门·白名单 CRUD（v050）", "test_console_api.py", False),
+    ("外部审计修复·输出回填·响铃·列表文件·原子写（v053）", "test_053_audit_fixes.py", False),
+    ("隐私修复·工具箱路径不写死（v056）", "test_056_privacy_fixes.py", False),
+    ("规则文件守卫·无复制粘贴污染（v057）", "test_057_rules_integrity.py", False),
+    ("白盒受控根校验（v058）", "test_058_codebase_paths.py", False),
+    ("白盒代码入库（v059）", "test_059_codebase_ingest.py", False),
+    ("白盒代码索引（v060）", "test_060_codebase_index.py", False),
+    ("白盒代码检索与 sink 规则库（v061）", "test_061_codebase_search.py", False),
+    ("白盒依赖清单 SBOM（v062）", "test_062_codebase_sbom.py", False),
+    ("白盒工具接线（v063）", "test_063_codebase_tools.py", False),
+    ("白盒证据闸门（v064）", "test_064_codebase_evidence.py", False),
+    ("白盒召回基准（v065）", "test_065_recall_baseline.py", False),
+    ("白盒 KB 篇目（v068）", "test_068_kb_whitebox_docs.py", False),
+    ("白盒跨行污染（v069）", "test_069_taint_crossline.py", False),
+    ("白盒批量基准（v070）", "test_070_batch_benchmark.py", False),
+    ("白盒容器污染与口径（v072）", "test_072_container_taint.py", False),
+    ("白盒变体分析（v074）", "test_074_variants.py", False),
+    ("白盒入库显式排除（v076）", "test_076_ingest_exclude.py", False),
+    ("白盒规则误报修正（v077）", "test_077_rule_compile_fp.py", False),
+    ("白盒文件级排除（v078）", "test_078_exclude_glob.py", False),
+    ("白盒宽口径规则标注（v079）", "test_079_rule_wide_marking.py", False),
+    ("规格勾选框↔代码事实 守卫（v084）", "test_084_spec_checklist_sync.py", False),
+    ("白盒控制流前缀污染（v086）", "test_086_taint_prefixed_assign.py", False),
+    ("白盒控制流前缀清除与跨行赋值（v090）", "test_090_taint_ctrl_and_crossline.py", False),
+    ("白盒 sink 调用名覆盖（v091）", "test_091_sql_sink_names.py", False),
+    ("白盒括号区配平（v093）", "test_093_arg_region_balance.py", False),
+    ("工作模式闸门与提示词自洽（v102）", "test_v102_modes.py", False),
+    ("内置能力不得被当作本地可启动程序（v108）", "test_v108_fixes.py", False),
+    ("本机自备工具目录（v110）", "test_local_tools.py", False),
+    ("控制台统计看板 /api/console/stats（v111）", "test_console_stats.py", False),
+    ("控制台实时监控 /api/console/runs（v112）", "test_console_runs.py", False),
+    # v114 更名。⚠️ 这个套件原来**漏登记**了 —— 结果是全量回归的「套件登记自检」
+    # 直接中止（那条护栏是"不静默通过"的：否则「0 失败」会掩盖「压根没跑」）。
+    # 加新套件时**必须同时加进这张表**，否则等于没加。
+    ("品牌标识与更名一致性（v114）", "test_brand.py", False),
+    ("审计缺陷修复（v115：re/杀树/回灌/exclude/敏感文件/mode/连接）", "test_v115_fixes.py", False),
+    ("审计第三批（v116：死参数/死代码/java字段/TypeScript/篇数/预览别名）",
+     "test_v116_fixes.py", False),
+    ("别名迁移 P0-3（v117：单次生成 + 旧键迁移 + 0 死条目）",
+     "test_v117_alias_migration.py", False),
+    ("情报库与报告生成", "test_intel_report.py", False),
+    ("启动器与版本一致性", "test_launcher.py", False),
+    ("线索图后端", "test_graph.py", False),
+    ("对话树", "test_tree.py", False),
+    ("记忆机制（续聊恢复/异常沉淀/溯源）", "test_memory.py", False),
+    ("可靠性（取消/重放/幂等/故障转移 v011）", "test_reliability.py", False),
+    ("Token 用量统计", "test_usage.py", False),
+    ("知识库与 FOFA", "test_kb_fofa.py", False),
+    ("供应商模块（Python 层）", "test_multi_llm.py", False),
+    ("Agent 冒烟 + 线索链联动", "test_agent_smoke.py", False),
+    ("线索图端到端", "test_graph_e2e.py", True),      # 需要后端
+    ("供应商与项目接口", "test_llm_providers.py", True),
+]
+NODE_TESTS = [
+    ("高危确认闸门（前端）", "test_confirm_js.js"),
+    ("配置控制台前端", "test_console_js.js"),
+    ("前端主流程", "test_appjs.js"),
+    ("线索图前端", "test_graph_js.js"),
+]
+
+# 会真实执行工具 / 需要云端 Key 的脚本：不适合自动跑，列出来避免被误以为"已覆盖"
+MANUAL_TESTS = [
+    ("test_live_target.py", "授权实靶回归：驱动服务对授权目标跑真实工具（公益 SRC），"
+                            "目标运行时从 data/scope.json 读取。需先启动服务。项目规范指定改动后跑它"),
+    ("test_agent.py", "终端里跑一轮真实工具调用，会碰目标"),
+    ("test_api.py", "下发任务并消费 SSE，会真实执行工具"),
+    ("test_e2e_deepseek.py", "云端 LLM 驱动真实工具链路，需 API Key 且会碰目标"),
+]
+# 已经跑不起来的脚本。列出来（并直接跳过，不再计入通过/失败），别让它悄悄烂着。
+# 2026-09-16 起不为空：v004→006 拉上游（Lyum1d/MY-AGENT）时，
+# update.py 把 app/*.py 与 web/{app.js,index.html,style.css} 整体覆盖，
+# 本地自研的「线索树导航 / 线索图 UI」「面板加载失败提示」被覆盖掉
+# （上游前端里没有这些）。经确认不恢复前端，故 test_appjs.js 整体下线；
+# 后端线索图已按 git HEAD 恢复，所以 test_graph.py 照常跑。
+STALE_TESTS: list[tuple[str, str]] = [
+    ("test_appjs.js",
+     "依赖本地自研前端（线索树导航 / 线索图 UI / 面板加载失败提示）。"
+     "拉上游更新时 index.html 与 app.js 被整体覆盖，这些函数在上游版里不存在，"
+     "功能已下线。保留脚本以便日后恢复前端时重新启用。"),
+]
+# 已下线脚本的文件名集合（执行时直接跳过，理由见上）
+RETIRED_SCRIPTS = {s for s, _ in STALE_TESTS}
+
+
+def unclassified_tests() -> list[str]:
+    """根目录里**没有被显式分类**的测试脚本（v090 新增守卫）。
+
+    ## 为什么需要它（v090 实测撞上的）
+
+    本文件的套件清单是**显式登记**的 —— 新加的 `test_*.py` **不会自动被跑**。
+    v090 加 `test_090_taint_ctrl_and_crossline.py` 时就是这样：全套跑完显示
+    「3006 项通过 / 0 项失败」，而那个文件**一次都没执行**。
+
+    ⚠️ 这与 v084 的「规格勾选框**必然会**漂移」同族：**没有守卫的事实，迟早会静默漂移。**
+    而且这里的失效模式更坏 —— 它伪装成**绿灯**（"0 失败"）而不是红灯。
+
+    判据：每个 `test_*.py` / `test_*.js` 必须落进下列之一：
+    ① `PY_TESTS` ② `NODE_TESTS` ③ `MANUAL_TESTS` ④ `STALE_TESTS`。
+    落在外面 = 它永远不会被执行，却仍在给人"测过了"的错觉。
+    """
+    known = ({s for _n, s, _srv in PY_TESTS}
+             | {s for _n, s in NODE_TESTS}
+             | {s for s, _w in MANUAL_TESTS}
+             | {s for s, _w in STALE_TESTS})
+    out: list[str] = []
+    for pat in ("test_*.py", "test_*.js"):
+        for fp in sorted(ROOT.glob(pat)):
+            if fp.name not in known:
+                out.append(fp.name)
+    return out
+
+
+def registered_count() -> int:
+    """已登记的套件总数（供自检输出用）。"""
+    return len(PY_TESTS) + len(NODE_TESTS) + len(MANUAL_TESTS) + len(STALE_TESTS)
+
+
+RE_COUNT_CN = re.compile(r"通过\s*(\d+)\s*项，失败\s*(\d+)\s*项")
+RE_COUNT_SMOKE = re.compile(r"结果：(\d+)\s*通过\s*/\s*(\d+)\s*失败")
+RE_SKIP_SMOKE = re.compile(r"结果：\d+\s*通过\s*/\s*\d+\s*失败\s*/\s*(\d+)\s*跳过")
+RE_FAILITEM = re.compile(r"失败项：(.+)")
+
+
+def port_open(port: int) -> bool:
+    with socket.socket() as s:
+        s.settimeout(0.4)
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+def _local_opener():
+    """构造一个**不走环境代理**的 opener。
+
+    本机有 HTTP(S)_PROXY 环境变量，回环探测没有理由经过代理（多一跳、且代理
+    对非白名单目标会返回 502），所以统一用空 ProxyHandler。
+    注：实测本机裸 urlopen 对回环也能通，所以**这不是** 2026-09-23 那次
+    「探测不到自己的服务」的原因 —— 真因见 probe_service 的超时说明。
+    留着它是为了消除一个不必要的依赖，不是当修复。
+    """
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+# 探测超时。**不能小**：/api/health 里含一段 MCP 状态探测，Burp 没开时要等
+# 满 SSE 探测超时（8s）才返回。原来写 2.0s，于是探测定时失败 →
+# 打印「端口被别的程序占用」→ **静默跳过两个端到端套件**，
+# 而汇总行照样写「合计 N 项通过 / 0 项失败」—— 跳过被读成了绿灯。
+# （2026-09-23 实测：health 用时 8.07s，2s 超时必失败；30s 正常。）
+# 产品侧已给 health 加了「端口不监听就立刻返回」+ 结果 TTL 缓存，
+# 正常情形这次探测是毫秒级；这里的超时只是兜底。
+PROBE_TIMEOUT = 30.0
+
+
+def probe_service(timeout: float = PROBE_TIMEOUT) -> dict | None:
+    try:
+        # 绕环境代理：见 _local_opener 说明
+        with _local_opener().open(f"{BASE}/api/health", timeout=timeout) as r:
+            d = json.loads(r.read().decode("utf-8"))
+        if isinstance(d, dict) and "registry" in d and "toolbox" in d:
+            return d
+    except Exception:
+        return None
+    return None
+
+
+def wait_port(proc=None, deadline: float = 30.0) -> bool:
+    """等端口就绪。给了 proc 就在进程已退出时立刻返回 False——
+    否则 run.py 秒退（比如缺依赖）也要白等满 30 秒。"""
+    start = time.time()
+    while time.time() - start < deadline:
+        if port_open(PORT):
+            return True
+        if proc is not None and proc.poll() is not None:
+            return False
+        time.sleep(0.2)
+    return False
+
+
+def _has_deps(py: str) -> bool:
+    if not py:
+        return False
+    try:
+        p = subprocess.run(
+            [py, "-c", f"import {', '.join(REQUIRED_MODULES)}"],
+            capture_output=True, timeout=60)
+        return p.returncode == 0
+    except Exception:
+        return False
+
+
+def pick_python() -> tuple[str, str]:
+    """挑一个装了后端依赖的解释器，返回 (路径, 说明)。
+
+    为什么需要：sys.executable 未必是装依赖那个（托管解释器通常很干净）。
+    用错的解释器会让 6 个后端套件集体 ModuleNotFoundError，
+    而如果只报「未解析到结果统计」，看起来就像"测试本身有问题"。
+    """
+    cands: list[str] = []
+
+    def add(p: str | None) -> None:
+        if p and p not in cands:
+            cands.append(p)
+
+    add(sys.executable)
+    for n in ("python", "python3", "py"):
+        add(shutil.which(n))
+    home = os.path.expanduser("~")
+    for pat in (
+        os.path.join(home, "AppData", "Local", "Programs", "Python", "Python3*", "python.exe"),
+        r"C:\Python3*\python.exe",
+    ):
+        for p in sorted(glob.glob(pat), reverse=True):
+            add(p)
+
+    for c in cands:
+        if _has_deps(c):
+            note = "" if c == sys.executable else f"（自动切换：当前解释器缺 {'/'.join(REQUIRED_MODULES)}）"
+            return c, note
+    return sys.executable, f"[警告] 所有候选解释器都缺 {'/'.join(REQUIRED_MODULES)}，后端套件会崩"
+
+
+def error_hint(out: str, limit: int = 3) -> str:
+    """从子进程输出里抽出真正有用的报错行。
+
+    关键：套件崩在 import 阶段时，stdout 里是一堆 PASS，真正的死因在 traceback 里。
+    只贴最后几行会全是 PASS，所以优先捞 Error/Traceback/Exception 行。
+    """
+    lines = [l.strip() for l in (out or "").splitlines() if l.strip()]
+    if not lines:
+        return "无任何输出"
+    hits = [l for l in lines
+            if re.search(r"Traceback|Error|Exception|ModuleNotFound|错误", l)]
+    tail = hits[-limit:] if hits else lines[-limit:]
+    return " ｜ ".join(t[-110:] for t in tail)
+
+
+def parse_counts(out: str) -> tuple[int, int] | None:
+    m = RE_COUNT_CN.search(out) or RE_COUNT_SMOKE.search(out)
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def run_cmd(args: list[str], timeout: int = 600) -> tuple[int, str]:
+    env = os.environ.copy()
+    # 探测 localhost 时别让代理插一脚
+    for k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+        env.pop(k, None)
+    # 子套件强制 UTF-8（v010）：PYTHONIOENCODING 已在模块顶部 setdefault；
+    # python 命令行统一加 -X utf8（双保险）
+    if args and args[0].lower().endswith(("python.exe", "python")):
+        args = list(args) + ["-X", "utf8"]
+    try:
+        p = subprocess.run(args, cwd=str(ROOT), capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=timeout, env=env)
+        return p.returncode, (p.stdout or "") + (p.stderr or "")
+    except FileNotFoundError:
+        return 127, f"命令不存在：{args[0]}"
+    except subprocess.TimeoutExpired:
+        return 124, f"超时（>{timeout}s）"
+
+
+def preflight_tmp_writable() -> str:
+    """跑回归前先确认「临时目录能写」。返回空串表示通过，否则返回一句诊断。
+
+    为什么要有这一步（v053，来自一次外部审计的教训）：
+    那次审计在受限沙箱里跑回归，**42 个套件统一用 `tempfile.mkdtemp` 建临时根**，
+    而那个环境里 `mkdtemp` **成功返回路径、随后任何写入都被拒** ——
+    于是 41 个套件以 `sqlite3.OperationalError: unable to open database file` 异常退出。
+    审计方花了大量时间去判断"这是项目缺陷还是环境缺陷"，最后只能写进报告的「局限」一节。
+
+    这类失败的特征是**症状离原因很远**（现象是"数据库打不开"，真因是沙箱 ACL），
+    所以值得在入口处直接判掉并说清楚：**这是环境问题，不是回归失败**。
+    判定方式就用一次真实的「建目录 → 写文件 → 删文件」，不猜权限。
+    """
+    import shutil
+    import tempfile as _tf
+    try:
+        d = _tf.mkdtemp(prefix="src_agent_preflight_")
+    except Exception as e:                                   # noqa: BLE001
+        return (f"临时目录无法创建（{type(e).__name__}: {e}）。"
+                "请检查 TMPDIR/TEMP 是否可写。")
+    try:
+        p = os.path.join(d, "probe.txt")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("ok")
+        if open(p, encoding="utf-8").read() != "ok":
+            return f"临时目录写入后内容不符：{d}"
+    except Exception as e:                                   # noqa: BLE001
+        return (
+            f"**临时目录创建成功但不可写**（{d}）：{type(e).__name__}: {e}\n"
+            "  → 这会让所有用 `tempfile.mkdtemp` 建临时根的套件异常退出，"
+            "症状通常是 `sqlite3.OperationalError: unable to open database file`。\n"
+            "  → **这是运行环境问题，不是被测代码的缺陷**（已知场景：受限沙箱为新建目录"
+            "植入了对检查 API 不可见的拒绝项）。\n"
+            "  → 建议：把临时根换到工作区内（`os.makedirs` 方式创建），或在可写环境重跑。")
+    finally:
+        try:
+            shutil.rmtree(d)
+        except Exception:                                    # noqa: BLE001
+            pass
+    return ""
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="一键跑全部回归测试")
+    ap.add_argument("--quick", action="store_true", help="跳过需要起服务的端到端测试")
+    ap.add_argument("--ignore-env", action="store_true",
+                    help="环境自检不通过时也强行继续（默认直接终止）")
+    # 注意：重定向到文件时 print 默认块缓冲，汇总会卡在缓冲区里看不见
+    args = ap.parse_args()
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+
+    results: list[tuple[str, str, str]] = []      # (名称, 结论, 说明)
+    server_proc: subprocess.Popen | None = None
+    reuse = False
+
+    PY, py_note = pick_python()
+
+    print("=" * 62)
+    print("  LuminaSec · 全量回归")
+    print("=" * 62)
+    print(f"  解释器：{PY}")
+    if py_note:
+        print(f"  {py_note}")
+
+    # 环境自检（v053）：临时目录不可写会让几十个套件以"数据库打不开"的形态异常退出，
+    # 而真因与代码无关。宁可在这里直接停下并说清楚，也别让人对着 41 个异常猜。
+    _pre = preflight_tmp_writable()
+    if _pre and not args.ignore_env:
+        print("\n  [环境自检] 未通过 —— 已终止，避免把环境问题误读成回归失败：")
+        for _ln in _pre.splitlines():
+            print("    " + _ln)
+        print("\n  如确认要在此环境硬跑（结果不可信），加 --ignore-env。")
+        return 2
+    print("  [环境自检] 临时目录可写 ✓"
+          if not _pre else "  [环境自检] 未通过，但 --ignore-env 已指定，继续……")
+
+    # 套件登记自检（v090）：未登记的 test_*.py **不会被执行**，
+    # 而"0 失败"的绿灯会让人以为它跑过了 —— 宁可直接停下并说清是哪个文件。
+    _unclassed = unclassified_tests()
+    if _unclassed:
+        print("\n  [套件登记自检] 未通过 —— 下列脚本**没有被登记**，因此永远不会被执行：")
+        for _f in _unclassed:
+            print(f"    - {_f}")
+        print("  请把它加进 PY_TESTS / NODE_TESTS / MANUAL_TESTS / STALE_TESTS 之一。")
+        print("  ⚠️ 不静默通过：否则「0 失败」会掩盖「压根没跑」。")
+        return 2
+    print(f"  [套件登记自检] {registered_count()} 个脚本均已登记 ✓")
+
+    need_server = not args.quick
+    if need_server:
+        live = probe_service() if port_open(PORT) else None
+        if live:
+            reuse = True
+            print(f"  复用已在运行的服务（版本 {live.get('version', '?')} / "
+                  f"构建 {live.get('build', '?')}）")
+        elif port_open(PORT):
+            print(f"  [警告] 端口 {PORT} 有服务在监听，但 /api/health 探测失败"
+                  f"（{PROBE_TIMEOUT:.0f}s 超时或无预期字段），将跳过端到端测试。")
+            print("         常见原因：那是别的程序；或该服务 /api/health 被可选依赖"
+                  "（如 Burp MCP）拖慢。排除后重跑即可。")
+            need_server = False
+        else:
+            print("  启动临时服务…")
+            env = os.environ.copy()
+            for k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+                env.pop(k, None)
+            server_proc = subprocess.Popen(
+                [PY, "run.py", "--no-browser"], cwd=str(ROOT), env=env,
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            if not wait_port(server_proc):
+                # 别把 stderr 丢进 DEVNULL：服务起不来时必须能看见为什么
+                err = b""
+                try:
+                    server_proc.terminate()
+                    _, err = server_proc.communicate(timeout=5)
+                except Exception:
+                    pass
+                hint = error_hint((err or b"").decode("utf-8", "replace"))
+                print(f"  [错误] 临时服务启动失败，将跳过端到端测试。")
+                print(f"         原因：{hint}")
+                server_proc = None
+                need_server = False
+    print()
+
+    try:
+        for name, script, needs_server in PY_TESTS:
+            if script in RETIRED_SCRIPTS:
+                why = dict(STALE_TESTS)[script]
+                results.append((name, "跳过", f"已下线（{why}）"))
+                print(f"  [跳过] {name} → 已下线：{why}")
+                continue
+            if needs_server and not need_server:
+                results.append((name, "跳过", f"未启动后端（{script}）"))
+                print(f"  [跳过] {name}")
+                continue
+            code, out = run_cmd([PY, script])
+            counts = parse_counts(out)
+            if counts is None:
+                # 退出码非 0 = 脚本根本没跑完（多半是 import 阶段就崩了）。
+                # 只说"没解析到结果"会把 ModuleNotFoundError 这类死因藏起来。
+                if code != 0:
+                    hint = error_hint(out)
+                    results.append((name, "异常", f"退出码 {code}：{hint}"))
+                    print(f"  [异常] {name}（退出码 {code}）→ {hint}")
+                else:
+                    results.append((name, "异常", "跑完但没有结果统计行（脚本输出格式变了？）"))
+                    print(f"  [异常] {name}（无结果统计行）")
+                continue
+            passed, failed = counts
+            fail_items = RE_FAILITEM.search(out)
+            detail = f"{passed} 通过 / {failed} 失败"
+            sm = RE_SKIP_SMOKE.search(out)
+            if sm and int(sm.group(1)):
+                detail += f"（{sm.group(1)} 项跳过：环境未就绪）"
+            if failed:
+                detail += f"（{fail_items.group(1).strip()}）" if fail_items else ""
+            # 唯一放行：未配 DeepSeek Key 导致的路由用例
+            only_known = (failed == 1 and fail_items
+                          and KNOWN_ENV_FAIL in fail_items.group(1))
+            results.append((name, "通过" if only_known else ("失败" if failed else "通过"),
+                            detail + ("（已知环境依赖，非回归）" if only_known else "")))
+            print(f"  [{'通过' if only_known or not failed else '失败'}] {name} → {detail}")
+
+        for name, script in NODE_TESTS:
+            if script in RETIRED_SCRIPTS:
+                why = dict(STALE_TESTS)[script]
+                results.append((name, "跳过", f"已下线（{why}）"))
+                print(f"  [跳过] {name} → 已下线：{why}")
+                continue
+            code, out = run_cmd([NODE, script])
+            counts = parse_counts(out)
+            if counts is None:
+                extra = "（node 是否在 PATH？）" if code == 127 else ""
+                hint = error_hint(out) if code not in (0, 127) else ""
+                detail = f"没有解析到结果统计{extra}" + (f"：{hint}" if hint else "")
+                results.append((name, "异常", detail))
+                print(f"  [异常] {name}（退出码 {code}）{('→ ' + hint) if hint else extra}")
+                continue
+            passed, failed = counts
+            results.append((name, "通过" if not failed else "失败",
+                            f"{passed} 通过 / {failed} 失败"))
+            print(f"  [{'通过' if not failed else '失败'}] {name} → "
+                  f"{passed} 通过 / {failed} 失败")
+    finally:
+        if server_proc is not None:
+            server_proc.terminate()
+            try:
+                server_proc.wait(timeout=8)
+            except subprocess.TimeoutExpired:
+                server_proc.kill()
+            print("\n  临时服务已关闭" + ("（原本就在运行的服务未受影响）" if reuse else ""))
+
+    total_pass = total_fail = 0
+    for _, _, detail in results:
+        nums = re.search(r"(\d+) 通过 / (\d+) 失败", detail)
+        if nums:
+            total_pass += int(nums.group(1))
+            total_fail += int(nums.group(2))
+
+    print()
+    print("-" * 62)
+    for name, verdict, detail in results:
+        mark = {"通过": "✓", "失败": "✗", "跳过": "-", "异常": "!"}.get(verdict, "?")
+        print(f"  {mark} {name:22s} {detail}")
+    print("-" * 62)
+    bad = [r for r in results if r[1] in ("失败", "异常")]
+    print(f"  合计 {total_pass} 项通过 / {total_fail} 项失败"
+          + (f"；{len([r for r in results if r[1] == '跳过'])} 项跳过" if any(
+              r[1] == "跳过" for r in results) else ""))
+    if bad:
+        print("  未通过：" + "、".join(r[0] for r in bad))
+
+    # 覆盖范围要说清楚：哪些是手工的、哪些已经失效，别让人以为"跑绿了就全覆盖了"
+    print()
+    print("  未纳入自动跑：")
+    for name, why in MANUAL_TESTS:
+        print(f"    手工  {name:22s} {why}")
+    for name, why in STALE_TESTS:
+        print(f"    失效  {name:22s} {why}")
+    if not STALE_TESTS:
+        print("    （当前没有失效脚本）")
+    print("=" * 62)
+    return 1 if bad else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
